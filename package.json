@@ -1,3 +1,4 @@
+
 {
   "name": "taskforge-ai",
   "version": "1.0.0",
@@ -22,6 +23,7 @@
     "cloudinary": "^2.7.0",
     "ejs": "^3.1.10",
     "express-ejs-layouts": "^2.5.1",
-    "dotenv": "^16.6.1"
+    "dotenv": "^16.6.1",
+    "openai": "^7.15.0"
   }
 }
