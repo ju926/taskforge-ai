@@ -1,0 +1,12 @@
+{
+  "name": "taskforge-ai",
+  "version": "1.0.0",
+  "description": "AI training and transcription task platform",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": "22.x"
+  }
+}
