@@ -1,7 +1,5 @@
 'use strict';
 
-require('dotenv').config();
-
 const express = require('express');
 const session = require('express-session');
 const pgSession = require('connect-pg-simple')(session);
@@ -10,30 +8,22 @@ const bcrypt = require('bcryptjs');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const OpenAI = require('openai');
-const crypto = require('crypto');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 
-const required = [
-  'DATABASE_URL',
-  'SESSION_SECRET',
-  'ADMIN_EMAIL',
-  'ADMIN_PASSWORD'
-];
-
-for (const key of required) {
-  if (!process.env[key]) {
-    console.error(`Missing required environment variable: ${key}`);
-    process.exit(1);
-  }
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL is required');
+}
+if (!process.env.SESSION_SECRET) {
+  throw new Error('SESSION_SECRET is required');
 }
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: process.env.NODE_ENV === 'production'
     ? { rejectUnauthorized: false }
-    : undefined
+    : false
 });
 
 const openai = process.env.OPENAI_API_KEY
@@ -41,10 +31,10 @@ const openai = process.env.OPENAI_API_KEY
   : null;
 
 app.set('trust proxy', 1);
+app.disable('x-powered-by');
 app.use(helmet());
 app.use(express.urlencoded({ extended: false, limit: '100kb' }));
 app.use(express.json({ limit: '100kb' }));
-app.use(express.static('public'));
 
 app.use(session({
   store: new pgSession({
@@ -62,972 +52,672 @@ app.use(session({
   }
 }));
 
-const loginLimiter = rateLimit({
+app.use(rateLimit({
   windowMs: 15 * 60 * 1000,
-  limit: 10,
+  limit: 200,
   standardHeaders: 'draft-7',
   legacyHeaders: false
-});
+}));
 
-function escapeHtml(value = '') {
-  return String(value).replace(/[&<>"']/g, c => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    '"': '&quot;',
-    "'": '&#39;'
-  })[c]);
-}
+const esc = value => String(value ?? '').replace(/[&<>"']/g, c => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;',
+  '"': '&quot;', "'": '&#39;'
+}[c]));
 
-function page(title, body, user = null) {
-  return `<!doctype html>
+const page = (title, body, user = null) => `<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>${escapeHtml(title)} | TaskForge AI</title>
+<title>${esc(title)} · TaskForge AI</title>
 <style>
-*{box-sizing:border-box}
-body{margin:0;background:#f3f5fa;color:#172033;
-font-family:Arial,sans-serif}
-header{background:#172554;color:white;padding:18px}
-header a{color:white;margin-right:14px}
-main{max-width:1000px;margin:22px auto;padding:16px}
-.card{background:white;padding:20px;margin:14px 0;
-border-radius:12px;box-shadow:0 2px 12px #0000000c}
-input,select,textarea,button{width:100%;padding:12px;
-margin:7px 0;border:1px solid #ccd2df;border-radius:7px}
-button,.btn{background:#2563eb;color:white;border:0;
-padding:12px;display:inline-block;text-decoration:none;
-border-radius:7px;cursor:pointer}
-.muted{color:#64748b;font-size:14px}
-.tag{display:inline-block;background:#dbeafe;padding:5px 8px;
-border-radius:6px;margin:4px}
-a{color:#1d4ed8}
-pre{white-space:pre-wrap;overflow-wrap:anywhere}
+*{box-sizing:border-box}body{margin:0;background:#f3f5fb;color:#172033;font:16px Arial,sans-serif}
+header{background:#182747;color:white;padding:16px 5%;display:flex;justify-content:space-between;gap:12px;flex-wrap:wrap}
+header a{color:white;margin-right:12px}main{max-width:1000px;margin:24px auto;padding:0 14px}
+.card{background:white;padding:20px;margin:14px 0;border-radius:14px;box-shadow:0 3px 15px #18274712}
+input,textarea,select{width:100%;padding:12px;margin:7px 0 14px;border:1px solid #ccd3e0;border-radius:8px;font:inherit}
+button,.btn{display:inline-block;background:#315ce8;color:white;border:0;border-radius:8px;padding:11px 16px;cursor:pointer;text-decoration:none;font:inherit}
+.secondary{background:#526078}.danger{background:#b42318}.muted{color:#667085}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px}
+small{overflow-wrap:anywhere}pre{white-space:pre-wrap;overflow-wrap:anywhere}
 </style>
 </head>
 <body>
-<header>
-<strong>TaskForge AI</strong>
-<nav style="margin-top:12px">
+<header><strong>TaskForge AI</strong><nav>
 <a href="/">Home</a>
-${user ? '<a href="/dashboard">Dashboard</a><a href="/logout">Logout</a>' : '<a href="/login">Login</a><a href="/register">Register</a>'}
+${user ? '<a href="/dashboard">Dashboard</a><a href="/tasks">Tasks</a><a href="/logout">Log out</a>' : '<a href="/login">Log in</a><a href="/register">Register</a>'}
 ${user && user.role === 'admin' ? '<a href="/admin">Admin</a>' : ''}
-</nav>
-</header>
+</nav></header>
 <main>${body}</main>
-</body>
-</html>`;
-}
+</body></html>`;
 
-function notice(message) {
-  return `<div class="card">${escapeHtml(message)}</div>`;
-}
+const box = (title, body) =>
+  `<section class="card"><h2>${title}</h2>${body}</section>`;
 
-function requireLogin(req, res, next) {
-  if (!req.session.user) {
-    return res.redirect('/login');
-  }
+const link = (url, label) =>
+  `<a class="btn" href="${url}">${label}</a>`;
+
+function requireAuth(req, res, next) {
+  if (!req.session.user) return res.redirect('/login');
   next();
 }
-
 function requireAdmin(req, res, next) {
   if (!req.session.user || req.session.user.role !== 'admin') {
-    return res.status(403).send(page(
-      'Forbidden',
-      notice('Administrator access required.'),
-      req.session.user
-    ));
+    return res.status(403).send(page('Forbidden', '<h2>Admin access required</h2>', req.session.user));
   }
   next();
 }
-
-function csrfToken(req) {
+function redirectMessage(res, path, message) {
+  return res.redirect(path + '?message=' + encodeURIComponent(message));
+}
+function flash(req) {
+  return req.query.message
+    ? `<p class="card">${esc(req.query.message)}</p>`
+    : '';
+}
+function csrf(req) {
   if (!req.session.csrf) {
-    req.session.csrf = crypto.randomBytes(32).toString('hex');
+    req.session.csrf = require('crypto').randomBytes(24).toString('hex');
   }
-  return req.session.csrf;
+  return `<input type="hidden" name="_csrf" value="${esc(req.session.csrf)}">`;
 }
-
-function csrfField(req) {
-  return `<input type="hidden" name="_csrf" value="${escapeHtml(csrfToken(req))}">`;
-}
-
 app.use((req, res, next) => {
   if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(req.method)) {
-    const supplied = req.body && req.body._csrf;
-    const expected = req.session.csrf;
-
-    if (
-      !supplied ||
-      !expected ||
-      supplied.length !== expected.length ||
-      !crypto.timingSafeEqual(
-        Buffer.from(supplied),
-        Buffer.from(expected)
-      )
-    ) {
-      return res.status(403).send(
-        page('Security check', notice('Security token expired. Go back and try again.'), req.session.user)
-      );
+    const sent = req.body && req.body._csrf;
+    if (!sent || !req.session.csrf || sent !== req.session.csrf) {
+      return res.status(403).send(page(
+        'Security check',
+        '<h2>Security check failed</h2><p>Go back, refresh the form and try again.</p>',
+        req.session.user
+      ));
     }
   }
   next();
 });
-
-async function initDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS users (
-      id BIGSERIAL PRIMARY KEY,
-      name TEXT NOT NULL,
-      email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL DEFAULT 'worker',
-      paypal_email TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS tasks (
-      id BIGSERIAL PRIMARY KEY,
-      title TEXT NOT NULL,
-      description TEXT NOT NULL,
-      task_type TEXT NOT NULL,
-      reward NUMERIC(10,2) NOT NULL DEFAULT 0,
-      media_url TEXT,
-      payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-      status TEXT NOT NULL DEFAULT 'draft',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS submissions (
-      id BIGSERIAL PRIMARY KEY,
-      task_id BIGINT NOT NULL REFERENCES tasks(id),
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      answer TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      reviewer_note TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      reviewed_at TIMESTAMPTZ,
-      UNIQUE(task_id, user_id)
-    );
-
-    CREATE TABLE IF NOT EXISTS screenings (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      answers JSONB NOT NULL DEFAULT '{}'::jsonb,
-      status TEXT NOT NULL DEFAULT 'pending',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      reviewed_at TIMESTAMPTZ
-    );
-
-    CREATE TABLE IF NOT EXISTS payouts (
-      id BIGSERIAL PRIMARY KEY,
-      user_id BIGINT NOT NULL REFERENCES users(id),
-      amount NUMERIC(10,2) NOT NULL,
-      paypal_email TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'pending',
-      transaction_id TEXT,
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE TABLE IF NOT EXISTS ai_task_queue (
-      id BIGSERIAL PRIMARY KEY,
-      task_type TEXT NOT NULL,
-      payload JSONB NOT NULL,
-      status TEXT NOT NULL DEFAULT 'draft',
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-
-    CREATE INDEX IF NOT EXISTS tasks_status_idx ON tasks(status);
-    CREATE INDEX IF NOT EXISTS submissions_status_idx ON submissions(status);
-    CREATE INDEX IF NOT EXISTS ai_queue_status_idx ON ai_task_queue(status);
-  `);
-
-  const adminEmail = process.env.ADMIN_EMAIL.trim().toLowerCase();
-  const passwordHash = await bcrypt.hash(process.env.ADMIN_PASSWORD, 12);
-
-  await pool.query(`
-    INSERT INTO users (name, email, password_hash, role)
-    VALUES ($1, $2, $3, 'admin')
-    ON CONFLICT (email) DO UPDATE SET role = 'admin'
-  `, ['TaskForge Administrator', adminEmail, passwordHash]);
-
-  console.log('Database tables ready.');
-}
 
 app.get('/health', async (req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({
-      status: 'ok',
-      platform: 'TaskForge AI',
-      database: 'connected',
-      aiConfigured: Boolean(openai)
-    });
-  } catch {
-    res.status(503).json({ status: 'error', database: 'disconnected' });
+    res.json({ ok: true, database: 'connected' });
+  } catch (e) {
+    console.error('Health check failed:', e.message);
+    res.status(503).json({ ok: false, database: 'unavailable' });
   }
 });
 
-app.get('/', (req, res) => {
-  res.send(page('Home', `
-    <section class="card">
-      <h1>TaskForge AI</h1>
-      <p>Complete data tasks, transcription exercises and AI evaluation work.</p>
-      <p>Register an account to view available tasks.</p>
-      <a class="btn" href="/register">Create account</a>
-      <a class="btn" href="/login">Login</a>
-    </section>
-    <section class="card">
-      <h2>Task categories</h2>
-      <p><span class="tag">Text</span><span class="tag">Audio</span>
-      <span class="tag">Video annotation</span><span class="tag">Evaluation</span></p>
-      <p class="muted">Tasks are subject to review and approval. Rewards are not guaranteed until a submission is approved.</p>
-    </section>
-  `, req.session.user));
-});
+app.get('/', (req, res) => res.send(page('Home', `
+<section class="card">
+<h1>Welcome to TaskForge AI</h1>
+<p>Complete available data tasks, submit your work for review and track approved earnings.</p>
+${req.session.user ? link('/dashboard', 'Open dashboard') : link('/register', 'Create worker account')}
+</section>
+${box('How it works', '<p>1. Register. 2. Complete screening. 3. Wait for approval. 4. Complete tasks and submit work. 5. Request a payout after approval.</p>')}
+`, req.session.user)));
 
-app.get('/register', (req, res) => {
-  res.send(page('Register', `
-    <section class="card">
-      <h1>Create worker account</h1>
-      <form method="post" action="/register">
-        ${csrfField(req)}
-        <input name="name" placeholder="Full name" maxlength="100" required>
-        <input name="email" type="email" placeholder="Email address" maxlength="254" required>
-        <input name="password" type="password" placeholder="Password (at least 10 characters)" minlength="10" required>
-        <button type="submit">Register</button>
-      </form>
-    </section>
-  `));
-});
+app.get('/register', (req, res) => res.send(page('Register', `
+${flash(req)}
+${box('Create account', `<form method="post" action="/register">
+${csrf(req)}
+<label>Name</label><input name="name" maxlength="120" required>
+<label>Email</label><input type="email" name="email" maxlength="255" required>
+<label>Password (at least 10 characters)</label><input type="password" name="password" minlength="10" required>
+<button>Create account</button></form>`)}
+`)));
 
-app.post('/register', loginLimiter, async (req, res, next) => {
+app.post('/register', async (req, res) => {
+  const name = String(req.body.name || '').trim();
+  const email = String(req.body.email || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!name || name.length > 120 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+      email.length > 255 || password.length < 10 || password.length > 200) {
+    return redirectMessage(res, '/register', 'Check your details and use a password of at least 10 characters.');
+  }
   try {
-    const name = String(req.body.name || '').trim();
-    const email = String(req.body.email || '').trim().toLowerCase();
-    const password = String(req.body.password || '');
-
-    if (!name || name.length > 100 || !email || email.length > 254 || password.length < 10) {
-      return res.status(400).send(page('Register', notice('Enter a valid name, email and password of at least 10 characters.')));
-    }
-
     const hash = await bcrypt.hash(password, 12);
-
     await pool.query(
-      `INSERT INTO users (name, email, password_hash)
-       VALUES ($1, $2, $3)`,
+      'INSERT INTO users(name,email,password_hash) VALUES($1,$2,$3)',
       [name, email, hash]
     );
-
-    res.redirect('/login');
-  } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).send(page('Register', notice('That email is already registered.')));
-    }
-    next(err);
+    return redirectMessage(res, '/login', 'Account created. Please log in.');
+  } catch (e) {
+    if (e.code === '23505') return redirectMessage(res, '/register', 'That email is already registered.');
+    console.error('Registration failed:', e.message);
+    return res.status(500).send(page('Error', '<p>Could not create account. Try again later.</p>'));
   }
 });
 
-app.get('/login', (req, res) => {
-  res.send(page('Login', `
-    <section class="card">
-      <h1>Login</h1>
-      <form method="post" action="/login">
-        ${csrfField(req)}
-        <input name="email" type="email" placeholder="Email address" required>
-        <input name="password" type="password" placeholder="Password" required>
-        <button type="submit">Login</button>
-      </form>
-    </section>
-  `));
-});
+app.get('/login', (req, res) => res.send(page('Log in', `
+${flash(req)}
+${box('Log in', `<form method="post" action="/login">
+${csrf(req)}
+<label>Email</label><input type="email" name="email" required>
+<label>Password</label><input type="password" name="password" required>
+<button>Log in</button></form>`)}
+`)));
 
-app.post('/login', loginLimiter, async (req, res, next) => {
+app.post('/login', async (req, res) => {
   try {
     const email = String(req.body.email || '').trim().toLowerCase();
-    const password = String(req.body.password || '');
-
-    const result = await pool.query(
-      'SELECT id, name, email, password_hash, role FROM users WHERE email = $1',
-      [email]
-    );
-
+    const result = await pool.query('SELECT * FROM users WHERE email=$1', [email]);
     const user = result.rows[0];
-
-    if (!user || !(await bcrypt.compare(password, user.password_hash))) {
-      return res.status(401).send(page('Login', notice('Invalid email or password.')));
+    if (!user || !(await bcrypt.compare(String(req.body.password || ''), user.password_hash))) {
+      return redirectMessage(res, '/login', 'Invalid email or password.');
     }
-
     req.session.regenerate(err => {
-      if (err) return next(err);
-
+      if (err) return res.status(500).send('Could not start session.');
       req.session.user = {
         id: user.id,
         name: user.name,
         email: user.email,
         role: user.role
       };
-
-      req.session.csrf = crypto.randomBytes(32).toString('hex');
-      res.redirect(user.role === 'admin' ? '/admin' : '/dashboard');
+      req.session.save(err2 => {
+        if (err2) return res.status(500).send('Could not save session.');
+        res.redirect('/dashboard');
+      });
     });
-  } catch (err) {
-    next(err);
+  } catch (e) {
+    console.error('Login failed:', e.message);
+    res.status(500).send(page('Error', '<p>Login failed. Try again later.</p>'));
   }
 });
 
-app.get('/logout', (req, res, next) => {
-  req.session.destroy(err => {
-    if (err) return next(err);
-    res.redirect('/');
-  });
+app.get('/logout', (req, res) => {
+  req.session.destroy(() => res.redirect('/'));
 });
 
-app.get('/dashboard', requireLogin, async (req, res, next) => {
+async function screeningApproved(userId) {
+  const r = await pool.query(
+    "SELECT id FROM screenings WHERE user_id=$1 AND status='approved' ORDER BY submitted_at DESC LIMIT 1",
+    [userId]
+  );
+  return r.rowCount > 0;
+}
+
+app.get('/dashboard', requireAuth, async (req, res) => {
   try {
-    const result = await pool.query(`
-      SELECT id, title, description, task_type, reward
-      FROM tasks
-      WHERE status = 'published'
-      ORDER BY created_at DESC
-      LIMIT 100
-    `);
-
-    const cards = result.rows.map(t => `
-      <section class="card">
-        <h3>${escapeHtml(t.title)}</h3>
-        <p>${escapeHtml(t.description)}</p>
-        <p>Type: ${escapeHtml(t.task_type)} | Reward: $${Number(t.reward).toFixed(2)}</p>
-        <a class="btn" href="/tasks/${t.id}">Open task</a>
-      </section>
-    `).join('');
-
-    res.send(page('Worker dashboard', `
-      <h1>Welcome, ${escapeHtml(req.session.user.name)}</h1>
-      <section class="card">
-        <h2>Available tasks</h2>
-        ${cards || '<p>No published tasks are available right now.</p>'}
-      </section>
-      <section class="card">
-        <h2>Screening</h2>
-        <p>Complete the screening form before working on platform tasks.</p>
-        <a class="btn" href="/screening">Open screening</a>
-      </section>
-      <section class="card">
-        <h2>PayPal payout details</h2>
-        <form method="post" action="/paypal-email">
-          ${csrfField(req)}
-          <input type="email" name="paypal_email" placeholder="Your PayPal email" maxlength="254" required>
-          <button type="submit">Save PayPal email</button>
-        </form>
-      </section>
-    `, req.session.user));
-  } catch (err) {
-    next(err);
+    const uid = req.session.user.id;
+    const [screen, earnings, submissions, payout] = await Promise.all([
+      pool.query('SELECT status,submitted_at,review_notes FROM screenings WHERE user_id=$1 ORDER BY submitted_at DESC LIMIT 1', [uid]),
+      pool.query("SELECT COALESCE(SUM(t.reward_usd),0) AS total FROM submissions s JOIN tasks t ON t.id=s.task_id WHERE s.user_id=$1 AND s.status='approved'", [uid]),
+      pool.query('SELECT COUNT(*)::int AS total FROM submissions WHERE user_id=$1', [uid]),
+      pool.query("SELECT COALESCE(SUM(amount_usd),0) AS total FROM payouts WHERE user_id=$1 AND status='pending'", [uid])
+    ]);
+    const sc = screen.rows[0];
+    res.send(page('Dashboard', `
+<h1>Hello, ${esc(req.session.user.name)}</h1>
+${box('Screening', sc ? `<p>Status: <strong>${esc(sc.status)}</strong></p><p>${esc(sc.review_notes || '')}</p>` : '<p>You must complete screening before accessing tasks.</p>')}
+${box('Your account', `<p>Approved task earnings: $${Number(earnings.rows[0].total).toFixed(2)}</p><p>Submissions: ${submissions.rows[0].total}</p><p>Pending payout requests: $${Number(payout.rows[0].total).toFixed(2)}</p>`)}
+${link('/screening', 'Screening')}
+${link('/tasks', 'Browse tasks')}
+${link('/payout', 'Request payout')}
+`, req.session.user));
+  } catch (e) {
+    console.error('Dashboard failed:', e.message);
+    res.status(500).send(page('Error', '<p>Dashboard could not load.</p>', req.session.user));
   }
 });
 
-app.get('/tasks/:id', requireLogin, async (req, res, next) => {
-  try {
-    const result = await pool.query(
-      `SELECT * FROM tasks WHERE id = $1 AND status = 'published'`,
-      [req.params.id]
-    );
-
-    const task = result.rows[0];
-    if (!task) return res.status(404).send(page('Task', notice('Task not found.'), req.session.user));
-
-    const media = task.media_url
-      ? `<p><a href="${escapeHtml(task.media_url)}" target="_blank" rel="noopener">Open task media</a></p>`
-      : '';
-
-    res.send(page('Task', `
-      <section class="card">
-        <h1>${escapeHtml(task.title)}</h1>
-        <p>${escapeHtml(task.description)}</p>
-        ${media}
-        <p>Type: ${escapeHtml(task.task_type)} | Reward: $${Number(task.reward).toFixed(2)}</p>
-        <form method="post" action="/tasks/${task.id}/submit">
-          ${csrfField(req)}
-          <textarea name="answer" rows="7" maxlength="20000" placeholder="Your answer" required></textarea>
-          <button type="submit">Submit for review</button>
-        </form>
-      </section>
-    `, req.session.user));
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/tasks/:id/submit', requireLogin, async (req, res, next) => {
-  try {
-    const answer = String(req.body.answer || '').trim();
-    if (!answer || answer.length > 20000) {
-      return res.status(400).send(page('Submit', notice('Please enter an answer under 20,000 characters.'), req.session.user));
-    }
-
-    const result = await pool.query(
-      `SELECT id FROM tasks WHERE id = $1 AND status = 'published'`,
-      [req.params.id]
-    );
-
-    if (!result.rows[0]) {
-      return res.status(404).send(page('Submit', notice('Task is not available.'), req.session.user));
-    }
-
-    await pool.query(`
-      INSERT INTO submissions (task_id, user_id, answer)
-      VALUES ($1, $2, $3)
-      ON CONFLICT (task_id, user_id) DO UPDATE
-      SET answer = EXCLUDED.answer, status = 'pending',
-          reviewer_note = NULL, created_at = NOW(), reviewed_at = NULL
-    `, [req.params.id, req.session.user.id, answer]);
-
-    res.redirect('/dashboard');
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get('/screening', requireLogin, (req, res) => {
+app.get('/screening', requireAuth, async (req, res) => {
+  const r = await pool.query(
+    'SELECT status,review_notes,submitted_at FROM screenings WHERE user_id=$1 ORDER BY submitted_at DESC LIMIT 1',
+    [req.session.user.id]
+  );
+  const latest = r.rows[0];
   res.send(page('Screening', `
-    <section class="card">
-      <h1>Worker screening</h1>
-      <p>Answer these sample questions. An administrator must review your screening before access is approved.</p>
-      <form method="post" action="/screening">
-        ${csrfField(req)}
-        <label>1. Explain why you should follow task instructions.</label>
-        <textarea name="q1" maxlength="3000" required></textarea>
-        <label>2. What would you do if a recording is unclear?</label>
-        <textarea name="q2" maxlength="3000" required></textarea>
-        <label>3. How do you protect private information?</label>
-        <textarea name="q3" maxlength="3000" required></textarea>
-        <button type="submit">Submit screening</button>
-      </form>
-    </section>
-  `, req.session.user));
+${flash(req)}
+${box('Worker screening', latest ? `<p>Latest status: <strong>${esc(latest.status)}</strong></p><p>${esc(latest.review_notes || '')}</p>` : '<p>No screening submitted yet.</p>')}
+${box('Submit screening', `<form method="post" action="/screening">
+${csrf(req)}
+<label>Describe how you would label a person walking across a video.</label>
+<textarea name="video" required maxlength="3000"></textarea>
+<label>Write a short sample transcription of speech.</label>
+<textarea name="audio" required maxlength="3000"></textarea>
+<label>How would you check your work for errors?</label>
+<textarea name="quality" required maxlength="3000"></textarea>
+<button>Submit screening</button></form><p>Screenings are reviewed by an administrator. Approval is not automatic.</p>`)}
+`, req.session.user));
 });
 
-app.post('/screening', requireLogin, async (req, res, next) => {
+app.post('/screening', requireAuth, async (req, res) => {
+  const answers = {
+    video: String(req.body.video || '').trim(),
+    audio: String(req.body.audio || '').trim(),
+    quality: String(req.body.quality || '').trim()
+  };
+  if (Object.values(answers).some(x => !x || x.length > 3000)) {
+    return redirectMessage(res, '/screening', 'Please complete every screening field.');
+  }
+  await pool.query(
+    "INSERT INTO screenings(user_id,answers,status) VALUES($1,$2::jsonb,'pending')",
+    [req.session.user.id, JSON.stringify(answers)]
+  );
+  redirectMessage(res, '/screening', 'Screening submitted for review.');
+});
+
+app.get('/tasks', requireAuth, async (req, res) => {
+  if (!(await screeningApproved(req.session.user.id))) {
+    return res.redirect('/screening');
+  }
+  const tasks = await pool.query(
+    `SELECT t.* FROM tasks t
+     WHERE t.published=TRUE
+     AND NOT EXISTS (SELECT 1 FROM submissions s WHERE s.task_id=t.id AND s.user_id=$1)
+     ORDER BY t.created_at DESC LIMIT 100`,
+    [req.session.user.id]
+  );
+  const html = tasks.rows.map(t => `<article class="card">
+<h3>${esc(t.title)}</h3><p>${esc(t.description)}</p>
+<p>Type: ${esc(t.task_type)} · Reward: $${Number(t.reward_usd).toFixed(2)}</p>
+${link('/tasks/' + t.id, 'Open task')}</article>`).join('') || '<p>No available tasks right now.</p>';
+  res.send(page('Tasks', `<h1>Available tasks</h1>${html}`, req.session.user));
+});
+
+app.get('/tasks/:id', requireAuth, async (req, res) => {
+  if (!(await screeningApproved(req.session.user.id))) return res.redirect('/screening');
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(404).send('Task not found');
+  const r = await pool.query('SELECT * FROM tasks WHERE id=$1 AND published=TRUE', [id]);
+  if (!r.rowCount) return res.status(404).send('Task not found');
+  const task = r.rows[0];
+  const existing = await pool.query('SELECT id FROM submissions WHERE task_id=$1 AND user_id=$2', [id, req.session.user.id]);
+  if (existing.rowCount) return res.redirect('/tasks');
+  const media = task.media_url
+    ? `<p>${task.media_type === 'video' ? 'Video' : task.media_type === 'audio' ? 'Audio' : 'Reference'}: <a href="${esc(task.media_url)}" target="_blank" rel="noopener">Open task media</a></p>`
+    : '';
+  res.send(page(task.title, `
+${box(esc(task.title), `<p>${esc(task.description)}</p><p>Task type: ${esc(task.task_type)}</p><p>Reward: $${Number(task.reward_usd).toFixed(2)}</p>${media}
+<form method="post" action="/tasks/${id}/submit">
+${csrf(req)}
+<label>Your answer / annotation</label>
+<textarea name="answer" rows="8" required maxlength="20000"></textarea>
+<button>Submit work</button></form>`)}
+`, req.session.user));
+});
+
+app.post('/tasks/:id/submit', requireAuth, async (req, res) => {
+  if (!(await screeningApproved(req.session.user.id))) return res.redirect('/screening');
+  const id = Number(req.params.id);
+  const answer = String(req.body.answer || '').trim();
+  if (!Number.isSafeInteger(id) || id < 1 || !answer || answer.length > 20000) {
+    return redirectMessage(res, '/tasks', 'Please enter a valid answer.');
+  }
   try {
-    const answers = {
-      q1: String(req.body.q1 || '').slice(0, 3000),
-      q2: String(req.body.q2 || '').slice(0, 3000),
-      q3: String(req.body.q3 || '').slice(0, 3000)
-    };
-
-    if (!answers.q1.trim() || !answers.q2.trim() || !answers.q3.trim()) {
-      return res.status(400).send(page('Screening', notice('Answer all screening questions.'), req.session.user));
-    }
-
-    await pool.query(`
-      INSERT INTO screenings (user_id, answers)
-      VALUES ($1, $2)
-    `, [req.session.user.id, JSON.stringify(answers)]);
-
-    res.send(page('Screening submitted', notice('Your screening is awaiting administrator review.'), req.session.user));
-  } catch (err) {
-    next(err);
+    await pool.query(
+      `INSERT INTO submissions(user_id,task_id,response)
+       SELECT $1,id,$3::jsonb FROM tasks WHERE id=$2 AND published=TRUE
+       ON CONFLICT(user_id,task_id) DO NOTHING`,
+      [req.session.user.id, id, JSON.stringify({ answer })]
+    );
+    redirectMessage(res, '/dashboard', 'Submission saved for review.');
+  } catch (e) {
+    console.error('Submission failed:', e.message);
+    res.status(500).send(page('Error', '<p>Could not submit this task.</p>', req.session.user));
   }
 });
 
-app.post('/paypal-email', requireLogin, async (req, res, next) => {
-  try {
-    const email = String(req.body.paypal_email || '').trim().toLowerCase();
-    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email) || email.length > 254) {
-      return res.status(400).send(page('PayPal', notice('Enter a valid PayPal email.'), req.session.user));
-    }
-
-    await pool.query('UPDATE users SET paypal_email = $1 WHERE id = $2', [
-      email,
-      req.session.user.id
-    ]);
-
-    res.redirect('/dashboard');
-  } catch (err) {
-    next(err);
-  }
+app.get('/payout', requireAuth, async (req, res) => {
+  const [user, totals, requests] = await Promise.all([
+    pool.query('SELECT paypal_email FROM users WHERE id=$1', [req.session.user.id]),
+    pool.query("SELECT COALESCE(SUM(t.reward_usd),0) AS total FROM submissions s JOIN tasks t ON t.id=s.task_id WHERE s.user_id=$1 AND s.status='approved'", [req.session.user.id]),
+    pool.query('SELECT * FROM payouts WHERE user_id=$1 ORDER BY requested_at DESC LIMIT 20', [req.session.user.id])
+  ]);
+  const list = requests.rows.map(p => `<p>$${Number(p.amount_usd).toFixed(2)} — ${esc(p.status)} — ${esc(p.requested_at)}</p>`).join('') || '<p>No payout requests yet.</p>';
+  res.send(page('Payout', `
+${flash(req)}
+${box('Request PayPal payout', `<p>Approved earnings: $${Number(totals.rows[0].total).toFixed(2)}</p>
+<form method="post" action="/payout">
+${csrf(req)}
+<label>PayPal email</label><input type="email" name="paypal_email" maxlength="255" value="${esc(user.rows[0].paypal_email || '')}" required>
+<label>Amount in USD</label><input type="number" name="amount" min="1" max="500" step="0.01" required>
+<button>Request payout</button></form><p>Payouts are manually reviewed and are not automatic.</p>`)}
+${box('Payout history', list)}
+`, req.session.user));
 });
 
-app.get('/admin', requireAdmin, async (req, res, next) => {
-  try {
-    const [users, tasks, queue, submissions, screenings, payouts] = await Promise.all([
-      pool.query('SELECT COUNT(*)::int AS n FROM users WHERE role = $1', ['worker']),
-      pool.query('SELECT COUNT(*)::int AS n FROM tasks'),
-      pool.query('SELECT COUNT(*)::int AS n FROM ai_task_queue WHERE status = $1', ['draft']),
-      pool.query('SELECT COUNT(*)::int AS n FROM submissions WHERE status = $1', ['pending']),
-      pool.query('SELECT COUNT(*)::int AS n FROM screenings WHERE status = $1', ['pending']),
-      pool.query('SELECT COUNT(*)::int AS n FROM payouts WHERE status = $1', ['pending'])
-    ]);
-
-    res.send(page('Admin', `
-      <h1>Admin dashboard</h1>
-      <section class="card">
-        <p>Workers: ${users.rows[0].n}</p>
-        <p>Tasks: ${tasks.rows[0].n}</p>
-        <p>AI drafts waiting to publish: ${queue.rows[0].n}</p>
-        <p>Pending submissions: ${submissions.rows[0].n}</p>
-        <p>Pending screenings: ${screenings.rows[0].n}</p>
-        <p>Pending payouts: ${payouts.rows[0].n}</p>
-      </section>
-
-      <section class="card">
-        <h2>Generate AI task queue</h2>
-        <p>Creates a small batch of drafts for review. Generation may incur API charges.</p>
-        <form method="post" action="/admin/generate">
-          ${csrfField(req)}
-          <label>Number of tasks (1–10)</label>
-          <input type="number" name="count" min="1" max="10" value="3" required>
-          <label>Task category</label>
-          <select name="task_type">
-            <option value="text">Text</option>
-            <option value="evaluation">Evaluation</option>
-            <option value="audio">Audio instructions</option>
-            <option value="video">Video annotation instructions</option>
-          </select>
-          <label>Reward per task in USD</label>
-          <input type="number" name="reward" min="0.10" max="50" step="0.10" value="1.00" required>
-          <button type="submit">Generate draft queue</button>
-        </form>
-      </section>
-
-      <section class="card">
-        <h2>Review AI drafts</h2>
-        <a class="btn" href="/admin/queue">Open AI queue</a>
-      </section>
-
-      <section class="card">
-        <h2>Review submissions and screening</h2>
-        <a class="btn" href="/admin/reviews">Open reviews</a>
-      </section>
-
-      <section class="card">
-        <h2>Payouts</h2>
-        <a class="btn" href="/admin/payouts">Manage payouts</a>
-      </section>
-
-      <section class="card">
-        <h2>Create a task manually</h2>
-        <form method="post" action="/admin/tasks">
-          ${csrfField(req)}
-          <input name="title" placeholder="Task title" maxlength="200" required>
-          <textarea name="description" placeholder="Instructions" maxlength="10000" required></textarea>
-          <select name="task_type">
-            <option value="text">Text</option>
-            <option value="evaluation">Evaluation</option>
-            <option value="audio">Audio</option>
-            <option value="video">Video annotation</option>
-          </select>
-          <input name="reward" type="number" min="0" max="50" step="0.01" value="1.00" required>
-          <input name="media_url" type="url" placeholder="Optional public media URL">
-          <button type="submit">Save as draft</button>
-        </form>
-      </section>
-    `, req.session.user));
-  } catch (err) {
-    next(err);
+app.post('/payout', requireAuth, async (req, res) => {
+  const email = String(req.body.paypal_email || '').trim();
+  const amount = Number(req.body.amount);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255 ||
+      !Number.isFinite(amount) || amount <= 0 || amount > 500) {
+    return redirectMessage(res, '/payout', 'Enter a valid PayPal email and amount.');
   }
-});
-
-app.post('/admin/generate', requireAdmin, async (req, res, next) => {
-  try {
-    if (!openai) {
-      return res.status(503).send(page('AI queue', notice('OpenAI is not configured. Add OPENAI_API_KEY in Render.'), req.session.user));
-    }
-
-    const count = Math.max(1, Math.min(10, Number.parseInt(req.body.count, 10) || 3));
-    const type = String(req.body.task_type || 'text');
-    const allowed = ['text', 'evaluation', 'audio', 'video'];
-
-    if (!allowed.includes(type)) {
-      return res.status(400).send(page('AI queue', notice('Invalid task category.'), req.session.user));
-    }
-
-    const reward = Number(req.body.reward);
-    if (!Number.isFinite(reward) || reward < 0.10 || reward > 50) {
-      return res.status(400).send(page('AI queue', notice('Reward must be between $0.10 and $50.'), req.session.user));
-    }
-
-    const response = await openai.responses.create({
-      model: process.env.OPENAI_MODEL || 'gpt-5.5',
-      instructions: [
-        'You create clear, fair and original tasks for an AI data work platform.',
-        'Return only valid JSON.',
-        'Do not create tasks requiring private data, real customer information, dangerous acts, or copyrighted source material.',
-        'For audio or video categories, create task instructions and a suggested asset prompt only. Do not claim an audio/video file has been generated.',
-        'Each task must have title, description, task_type, and payload.',
-        'payload must be a JSON object with task-specific instructions, expected answer format, and a short quality checklist.'
-      ].join(' '),
-      input: `Create exactly ${count} distinct ${type} tasks. Return JSON as {"tasks":[{"title":"...","description":"...","task_type":"${type}","payload":{"instructions":"...","answer_format":"...","quality_checklist":["..."]}}]}. Keep instructions practical and self-contained.`
-    });
-
-    let parsed;
-    try {
-      parsed = JSON.parse(response.output_text);
-    } catch {
-      throw new Error('The AI response was not valid JSON. Please retry with a smaller batch.');
-    }
-
-    if (!parsed || !Array.isArray(parsed.tasks) || parsed.tasks.length === 0) {
-      throw new Error('The AI did not return any tasks. Please try again.');
-    }
-
-    const created = [];
-    for (const item of parsed.tasks.slice(0, count)) {
-      const title = String(item.title || '').trim().slice(0, 200);
-      const description = String(item.description || '').trim().slice(0, 10000);
-      if (!title || !description) continue;
-
-      const taskType = allowed.includes(item.task_type) ? item.task_type : type;
-      const payload = item.payload && typeof item.payload === 'object' ? item.payload : {};
-
-      const result = await pool.query(`
-        INSERT INTO ai_task_queue (task_type, payload, status)
-        VALUES ($1, $2, 'draft')
-        RETURNING id
-      `, [
-        taskType,
-        JSON.stringify({
-          title,
-          description,
-          reward,
-          media_url: null,
-          task_payload: payload
-        })
-      ]);
-
-      created.push(result.rows[0].id);
-    }
-
-    if (!created.length) {
-      throw new Error('No valid tasks were created. Please retry.');
-    }
-
-    res.send(page('AI queue created', `
-      <section class="card">
-        <h1>AI draft queue created</h1>
-        <p>${created.length} draft task(s) saved. They are not visible to workers until you publish them.</p>
-        <a class="btn" href="/admin/queue">Review drafts</a>
-        <p class="muted">Audio/video tasks currently contain task instructions only; they do not automatically contain generated media.</p>
-      </section>
-    `, req.session.user));
-  } catch (err) {
-    console.error('AI task generation failed:', err.message);
-    next(err);
-  }
-});
-
-app.get('/admin/queue', requireAdmin, async (req, res, next) => {
-  try {
-    const result = await pool.query(`
-      SELECT id, task_type, payload, created_at
-      FROM ai_task_queue
-      WHERE status = 'draft'
-      ORDER BY created_at DESC
-      LIMIT 100
-    `);
-
-    const cards = result.rows.map(row => {
-      const payload = row.payload || {};
-      return `
-        <section class="card">
-          <h3>${escapeHtml(payload.title || 'Untitled task')}</h3>
-          <p>${escapeHtml(payload.description || '')}</p>
-          <p>Type: ${escapeHtml(row.task_type)} | Reward: $${Number(payload.reward || 0).toFixed(2)}</p>
-          <form method="post" action="/admin/queue/${row.id}/publish">
-            ${csrfField(req)}
-            <button type="submit">Publish task</button>
-          </form>
-          <form method="post" action="/admin/queue/${row.id}/delete">
-            ${csrfField(req)}
-            <button type="submit" style="background:#b91c1c">Delete draft</button>
-          </form>
-        </section>`;
-    }).join('');
-
-    res.send(page('AI queue', `
-      <h1>AI-generated draft queue</h1>
-      ${cards || '<section class="card">No drafts waiting for review.</section>'}
-      <a class="btn" href="/admin">Back to admin</a>
-    `, req.session.user));
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/admin/queue/:id/publish', requireAdmin, async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-
-    const result = await client.query(
-      `SELECT * FROM ai_task_queue WHERE id = $1 AND status = 'draft' FOR UPDATE`,
-      [req.params.id]
+    await client.query('UPDATE users SET paypal_email=$1 WHERE id=$2', [email, req.session.user.id]);
+    const approved = await client.query(
+      "SELECT COALESCE(SUM(t.reward_usd),0) AS total FROM submissions s JOIN tasks t ON t.id=s.task_id WHERE s.user_id=$1 AND s.status='approved'",
+      [req.session.user.id]
     );
-
-    const row = result.rows[0];
-    if (!row) {
+    const pending = await client.query(
+      "SELECT COALESCE(SUM(amount_usd),0) AS total FROM payouts WHERE user_id=$1 AND status='pending'",
+      [req.session.user.id]
+    );
+    if (amount > Number(approved.rows[0].total) - Number(pending.rows[0].total)) {
       await client.query('ROLLBACK');
-      return res.status(404).send(page('Publish', notice('Draft not found.'), req.session.user));
+      return redirectMessage(res, '/payout', 'Requested amount exceeds your available approved balance.');
     }
-
-    const p = row.payload || {};
-    if (!p.title || !p.description) {
-      await client.query('ROLLBACK');
-      return res.status(400).send(page('Publish', notice('Draft is missing a title or description.'), req.session.user));
-    }
-
-    await client.query(`
-      INSERT INTO tasks (title, description, task_type, reward, media_url, payload, status)
-      VALUES ($1, $2, $3, $4, $5, $6, 'published')
-    `, [
-      p.title,
-      p.description,
-      row.task_type,
-      Math.min(50, Math.max(0, Number(p.reward) || 0)),
-      p.media_url || null,
-      JSON.stringify(p.task_payload || {})
-    ]);
-
     await client.query(
-      `UPDATE ai_task_queue SET status = 'published' WHERE id = $1`,
-      [row.id]
+      "INSERT INTO payouts(user_id,amount_usd,paypal_email,status) VALUES($1,$2,$3,'pending')",
+      [req.session.user.id, amount.toFixed(2), email]
     );
-
     await client.query('COMMIT');
-    res.redirect('/admin/queue');
-  } catch (err) {
+    redirectMessage(res, '/payout', 'Payout request submitted for manual review.');
+  } catch (e) {
     await client.query('ROLLBACK');
-    next(err);
+    console.error('Payout request failed:', e.message);
+    res.status(500).send(page('Error', '<p>Could not request payout.</p>', req.session.user));
   } finally {
     client.release();
   }
 });
 
-app.post('/admin/queue/:id/delete', requireAdmin, async (req, res, next) => {
+app.get('/admin', requireAdmin, async (req, res) => {
+  const [users, tasks, submissions, screenings, payouts, drafts] = await Promise.all([
+    pool.query('SELECT COUNT(*)::int AS n FROM users'),
+    pool.query('SELECT COUNT(*)::int AS n FROM tasks'),
+    pool.query("SELECT COUNT(*)::int AS n FROM submissions WHERE status='pending'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM screenings WHERE status='pending'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM payouts WHERE status='pending'"),
+    pool.query("SELECT COUNT(*)::int AS n FROM ai_task_queue WHERE status='draft'")
+  ]);
+  res.send(page('Admin', `
+<h1>Admin dashboard</h1>${flash(req)}
+<div class="grid">
+${box('Users', `<p>${users.rows[0].n}</p>`)}
+${box('Tasks', `<p>${tasks.rows[0].n}</p>`)}
+${box('Pending submissions', `<p>${submissions.rows[0].n}</p>`)}
+${box('Pending screenings', `<p>${screenings.rows[0].n}</p>`)}
+${box('Pending payouts', `<p>${payouts.rows[0].n}</p>`)}
+${box('AI drafts', `<p>${drafts.rows[0].n}</p>`)}
+</div>
+${link('/admin/tasks', 'Manage tasks')}
+${link('/admin/reviews', 'Review submissions and screenings')}
+${link('/admin/payouts', 'Manage payouts')}
+${link('/admin/ai', 'Generate AI task drafts')}
+`, req.session.user));
+});
+
+app.get('/admin/tasks', requireAdmin, async (req, res) => {
+  const tasks = await pool.query('SELECT * FROM tasks ORDER BY created_at DESC LIMIT 100');
+  const list = tasks.rows.map(t => box(esc(t.title), `<p>${esc(t.description)}</p>
+<p>${esc(t.task_type)} · $${Number(t.reward_usd).toFixed(2)} · ${t.published ? 'Published' : 'Draft'}</p>
+<form method="post" action="/admin/tasks/${t.id}/publish">${csrf(req)}<button>${t.published ? 'Unpublish' : 'Publish'}</button></form>
+<form method="post" action="/admin/tasks/${t.id}/delete">${csrf(req)}<button class="danger">Delete task</button></form>`)).join('');
+  res.send(page('Manage tasks', `<h1>Manage tasks</h1>${flash(req)}${list}
+${box('Create task', `<form method="post" action="/admin/tasks">
+${csrf(req)}
+<label>Title</label><input name="title" maxlength="200" required>
+<label>Description</label><textarea name="description" maxlength="10000" required></textarea>
+<label>Task type</label><select name="task_type"><option value="text">Text</option><option value="audio_transcription">Audio transcription</option><option value="video_annotation">Video annotation</option><option value="evaluation">Evaluation</option></select>
+<label>Media URL (optional, must be a trusted URL)</label><input type="url" name="media_url">
+<label>Media type</label><select name="media_type"><option value="">None</option><option value="audio">Audio</option><option value="video">Video</option></select>
+<label>Reward USD (max $50)</label><input type="number" name="reward_usd" min="0" max="50" step="0.01" required>
+<label><input style="width:auto" type="checkbox" name="published" value="yes"> Publish immediately</label>
+<button>Create task</button></form>`)}
+`, req.session.user));
+});
+
+app.post('/admin/tasks', requireAdmin, async (req, res) => {
+  const title = String(req.body.title || '').trim();
+  const description = String(req.body.description || '').trim();
+  const taskType = String(req.body.task_type || '');
+  const mediaUrl = String(req.body.media_url || '').trim() || null;
+  const mediaType = String(req.body.media_type || '').trim() || null;
+  const reward = Number(req.body.reward_usd);
+  const allowed = ['text', 'audio_transcription', 'video_annotation', 'evaluation'];
+  if (!title || title.length > 200 || !description || description.length > 10000 ||
+      !allowed.includes(taskType) || !Number.isFinite(reward) || reward < 0 || reward > 50 ||
+      (mediaUrl && !/^https:\/\/\S+$/i.test(mediaUrl)) ||
+      ![null, 'audio', 'video'].includes(mediaType)) {
+    return redirectMessage(res, '/admin/tasks', 'Invalid task details. Rewards must be $0–$50.');
+  }
+  await pool.query(
+    'INSERT INTO tasks(title,description,task_type,media_url,media_type,reward_usd,published) VALUES($1,$2,$3,$4,$5,$6,$7)',
+    [title, description, taskType, mediaUrl, mediaType, reward.toFixed(2), req.body.published === 'yes']
+  );
+  redirectMessage(res, '/admin/tasks', 'Task created.');
+});
+
+app.post('/admin/tasks/:id/publish', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).send('Invalid task ID');
+  await pool.query('UPDATE tasks SET published=NOT published WHERE id=$1', [id]);
+  redirectMessage(res, '/admin/tasks', 'Task publishing status updated.');
+});
+
+app.post('/admin/tasks/:id/delete', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).send('Invalid task ID');
+  const exists = await pool.query('SELECT id FROM submissions WHERE task_id=$1 LIMIT 1', [id]);
+  if (exists.rowCount) return redirectMessage(res, '/admin/tasks', 'Cannot delete a task with submissions. Unpublish it instead.');
+  await pool.query('DELETE FROM tasks WHERE id=$1', [id]);
+  redirectMessage(res, '/admin/tasks', 'Task deleted if it existed.');
+});
+
+app.get('/admin/reviews', requireAdmin, async (req, res) => {
+  const [subs, screens] = await Promise.all([
+    pool.query(`SELECT s.id,s.response,s.submitted_at,s.user_id,s.task_id,u.email,t.title
+      FROM submissions s JOIN users u ON u.id=s.user_id JOIN tasks t ON t.id=s.task_id
+      WHERE s.status='pending' ORDER BY s.submitted_at LIMIT 100`),
+    pool.query(`SELECT s.id,s.answers,s.submitted_at,s.user_id,u.email
+      FROM screenings s JOIN users u ON u.id=s.user_id
+      WHERE s.status='pending' ORDER BY s.submitted_at LIMIT 100`)
+  ]);
+  const subHtml = subs.rows.map(s => box(`Submission #${s.id}`, `<p>${esc(s.email)} · ${esc(s.title)}</p>
+<pre>${esc(JSON.stringify(s.response, null, 2))}</pre>
+<form method="post" action="/admin/submissions/${s.id}">
+${csrf(req)}
+<select name="status"><option value="approved">Approve</option><option value="rejected">Reject</option></select>
+<input name="review_notes" maxlength="2000" placeholder="Review notes">
+<button>Save review</button></form>`)).join('') || '<p>No pending submissions.</p>';
+  const screenHtml = screens.rows.map(s => box(`Screening #${s.id}`, `<p>${esc(s.email)}</p><pre>${esc(JSON.stringify(s.answers, null, 2))}</pre>
+<form method="post" action="/admin/screenings/${s.id}">
+${csrf(req)}
+<select name="status"><option value="approved">Approve</option><option value="rejected">Reject</option></select>
+<input name="review_notes" maxlength="2000" placeholder="Review notes">
+<button>Save screening review</button></form>`)).join('') || '<p>No pending screenings.</p>';
+  res.send(page('Reviews', `<h1>Review work</h1>${box('Submissions', subHtml)}${box('Screenings', screenHtml)}`, req.session.user));
+});
+
+app.post('/admin/submissions/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const status = String(req.body.status || '');
+  if (!Number.isSafeInteger(id) || id < 1 || !['approved', 'rejected'].includes(status)) {
+    return redirectMessage(res, '/admin/reviews', 'Invalid review.');
+  }
+  await pool.query(
+    'UPDATE submissions SET status=$1,review_notes=$2,reviewed_at=NOW() WHERE id=$3 AND status=$4',
+    [status, String(req.body.review_notes || '').slice(0, 2000), id, 'pending']
+  );
+  redirectMessage(res, '/admin/reviews', 'Submission review saved.');
+});
+
+app.post('/admin/screenings/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const status = String(req.body.status || '');
+  if (!Number.isSafeInteger(id) || id < 1 || !['approved', 'rejected'].includes(status)) {
+    return redirectMessage(res, '/admin/reviews', 'Invalid screening review.');
+  }
+  await pool.query(
+    'UPDATE screenings SET status=$1,review_notes=$2,reviewed_at=NOW() WHERE id=$3 AND status=$4',
+    [status, String(req.body.review_notes || '').slice(0, 2000), id, 'pending']
+  );
+  redirectMessage(res, '/admin/reviews', 'Screening review saved.');
+});
+
+app.get('/admin/payouts', requireAdmin, async (req, res) => {
+  const r = await pool.query(`SELECT p.*,u.email FROM payouts p JOIN users u ON u.id=p.user_id
+    ORDER BY p.requested_at DESC LIMIT 100`);
+  const list = r.rows.map(p => box(`Payout #${p.id}`, `<p>${esc(p.email)} · $${Number(p.amount_usd).toFixed(2)} · ${esc(p.paypal_email)}</p><p>Status: ${esc(p.status)}</p>
+<form method="post" action="/admin/payouts/${p.id}">
+${csrf(req)}
+<select name="status"><option value="paid">Mark paid</option><option value="rejected">Reject</option><option value="pending">Keep pending</option></select>
+<input name="transaction_id" maxlength="500" placeholder="Transaction ID (if paid)">
+<input name="admin_notes" maxlength="2000" placeholder="Admin notes">
+<button>Update payout</button></form>`)).join('') || '<p>No payout requests.</p>';
+  res.send(page('Payouts', `<h1>Manage payouts</h1>${list}`, req.session.user));
+});
+
+app.post('/admin/payouts/:id', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  const status = String(req.body.status || '');
+  if (!Number.isSafeInteger(id) || id < 1 || !['paid', 'rejected', 'pending'].includes(status)) {
+    return redirectMessage(res, '/admin/payouts', 'Invalid payout update.');
+  }
+  await pool.query(
+    `UPDATE payouts SET status=$1,transaction_id=$2,admin_notes=$3,
+     paid_at=CASE WHEN $1='paid' THEN COALESCE(paid_at,NOW()) ELSE NULL END
+     WHERE id=$4`,
+    [status, String(req.body.transaction_id || '').slice(0, 500) || null,
+     String(req.body.admin_notes || '').slice(0, 2000) || null, id]
+  );
+  redirectMessage(res, '/admin/payouts', 'Payout updated.');
+});
+
+app.get('/admin/ai', requireAdmin, async (req, res) => {
+  const drafts = await pool.query("SELECT * FROM ai_task_queue WHERE status='draft' ORDER BY created_at DESC LIMIT 30");
+  const html = drafts.rows.map(d => {
+    const p = d.payload || {};
+    return box(esc(p.title || 'AI task draft'), `<p>${esc(p.description || '')}</p>
+<p>Type: ${esc(p.task_type || 'text')} · Reward: $${Number(p.reward_usd || 0).toFixed(2)}</p>
+<form method="post" action="/admin/ai/${d.id}/publish">${csrf(req)}<button>Publish task</button></form>
+<form method="post" action="/admin/ai/${d.id}/delete">${csrf(req)}<button class="danger">Delete draft</button></form>`);
+  }).join('') || '<p>No drafts waiting.</p>';
+  res.send(page('AI task generation', `<h1>AI task drafts</h1>${flash(req)}
+${box('Generate drafts', `<p>Creates up to 10 text-based drafts for admin review. It does not generate or host real audio/video files.</p>
+<form method="post" action="/admin/ai/generate">${csrf(req)}
+<label>Number of drafts</label><input type="number" name="count" min="1" max="10" value="5" required>
+<label>Task type</label><select name="task_type"><option value="text">Text</option><option value="evaluation">Evaluation</option><option value="audio_transcription">Audio transcription (requires media added separately)</option><option value="video_annotation">Video annotation (requires media added separately)</option></select>
+<button>Generate drafts</button></form>`)}
+${html}`, req.session.user));
+});
+
+app.post('/admin/ai/generate', requireAdmin, async (req, res) => {
+  if (!openai) return redirectMessage(res, '/admin/ai', 'OPENAI_API_KEY is not configured.');
+  const count = Math.max(1, Math.min(10, Number.parseInt(req.body.count, 10) || 5));
+  const type = String(req.body.task_type || 'text');
+  if (!['text', 'evaluation', 'audio_transcription', 'video_annotation'].includes(type)) {
+    return redirectMessage(res, '/admin/ai', 'Invalid task type.');
+  }
   try {
-    await pool.query(
-      `DELETE FROM ai_task_queue WHERE id = $1 AND status = 'draft'`,
-      [req.params.id]
+    const response = await openai.responses.create({
+      model: process.env.OPENAI_MODEL || 'gpt-5.5',
+      instructions: 'Generate safe, original data-labeling task drafts. Return only a JSON array. Each item must contain title, description, task_type, reward_usd. Use only the requested task_type. Keep rewards between 0.10 and 50 USD. Do not claim to create or attach real media files.',
+      input: `Create exactly ${count} task drafts of type ${type}. Each description should include clear worker instructions and an example where helpful. Return JSON array only.`,
+      max_output_tokens: 5000
+    });
+    let drafts;
+    try {
+      drafts = JSON.parse(response.output_text);
+    } catch {
+      throw new Error('AI did not return valid JSON. Try again.');
+    }
+    if (!Array.isArray(drafts)) throw new Error('AI response was not a list.');
+    let saved = 0;
+    for (const d of drafts.slice(0, count)) {
+      const title = String(d.title || '').trim().slice(0, 200);
+      const description = String(d.description || '').trim().slice(0, 10000);
+      const reward = Number(d.reward_usd);
+      if (!title || !description || !Number.isFinite(reward)) continue;
+      const payload = {
+        title, description, task_type: type,
+        reward_usd: Math.max(0.1, Math.min(50, reward)),
+        media_url: null, media_type: null
+      };
+      await pool.query(
+        "INSERT INTO ai_task_queue(task_type,payload,status) VALUES($1,$2::jsonb,'draft')",
+        [type, JSON.stringify(payload)]
+      );
+      saved++;
+    }
+    redirectMessage(res, '/admin/ai', `Saved ${saved} draft(s). Review before publishing.`);
+  } catch (e) {
+    console.error('AI generation failed:', e.message);
+    redirectMessage(res, '/admin/ai', 'AI generation failed. Check Render logs and OPENAI_MODEL/API access.');
+  }
+});
+
+app.post('/admin/ai/:id/publish', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).send('Invalid draft ID');
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const r = await client.query(
+      "SELECT * FROM ai_task_queue WHERE id=$1 AND status='draft' FOR UPDATE",
+      [id]
     );
-    res.redirect('/admin/queue');
-  } catch (err) {
-    next(err);
+    if (!r.rowCount) {
+      await client.query('ROLLBACK');
+      return redirectMessage(res, '/admin/ai', 'Draft not found.');
+    }
+    const p = r.rows[0].payload || {};
+    const title = String(p.title || '').slice(0, 200);
+    const description = String(p.description || '').slice(0, 10000);
+    const type = String(p.task_type || r.rows[0].task_type);
+    const reward = Number(p.reward_usd);
+    if (!title || !description || !['text','evaluation','audio_transcription','video_annotation'].includes(type) ||
+        !Number.isFinite(reward) || reward < 0 || reward > 50) {
+      await client.query('ROLLBACK');
+      return redirectMessage(res, '/admin/ai', 'Draft data is invalid.');
+    }
+    await client.query(
+      'INSERT INTO tasks(title,description,task_type,reward_usd,published) VALUES($1,$2,$3,$4,TRUE)',
+      [title, description, type, reward.toFixed(2)]
+    );
+    await client.query("UPDATE ai_task_queue SET status='published' WHERE id=$1", [id]);
+    await client.query('COMMIT');
+    redirectMessage(res, '/admin/ai', 'Task published.');
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('Publish AI task failed:', e.message);
+    res.status(500).send(page('Error', '<p>Could not publish draft.</p>', req.session.user));
+  } finally {
+    client.release();
   }
 });
 
-app.post('/admin/tasks', requireAdmin, async (req, res, next) => {
-  try {
-    const title = String(req.body.title || '').trim().slice(0, 200);
-    const description = String(req.body.description || '').trim().slice(0, 10000);
-    const type = String(req.body.task_type || 'text');
-    const reward = Number(req.body.reward);
-    const mediaUrl = String(req.body.media_url || '').trim();
-
-    if (!title || !description || !['text', 'evaluation', 'audio', 'video'].includes(type)) {
-      return res.status(400).send(page('Create task', notice('Check the title, instructions and category.'), req.session.user));
-    }
-
-    if (!Number.isFinite(reward) || reward < 0 || reward > 50) {
-      return res.status(400).send(page('Create task', notice('Reward must be between $0 and $50.'), req.session.user));
-    }
-
-    if (mediaUrl) {
-      const u = new URL(mediaUrl);
-      if (u.protocol !== 'https:') {
-        return res.status(400).send(page('Create task', notice('Media links must use HTTPS.'), req.session.user));
-      }
-    }
-
-    await pool.query(`
-      INSERT INTO tasks (title, description, task_type, reward, media_url, status)
-      VALUES ($1, $2, $3, $4, $5, 'draft')
-    `, [title, description, type, reward, mediaUrl || null]);
-
-    res.redirect('/admin');
-  } catch (err) {
-    next(err);
-  }
+app.post('/admin/ai/:id/delete', requireAdmin, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!Number.isSafeInteger(id) || id < 1) return res.status(400).send('Invalid draft ID');
+  await pool.query("UPDATE ai_task_queue SET status='deleted' WHERE id=$1 AND status='draft'", [id]);
+  redirectMessage(res, '/admin/ai', 'Draft deleted if it existed.');
 });
 
-app.get('/admin/reviews', requireAdmin, async (req, res, next) => {
-  try {
-    const [submissions, screenings] = await Promise.all([
-      pool.query(`
-        SELECT s.id, s.answer, s.created_at, u.name, t.title
-        FROM submissions s
-        JOIN users u ON u.id = s.user_id
-        JOIN tasks t ON t.id = s.task_id
-        WHERE s.status = 'pending'
-        ORDER BY s.created_at ASC LIMIT 100
-      `),
-      pool.query(`
-        SELECT s.id, s.answers, s.created_at, u.name, u.email
-        FROM screenings s
-        JOIN users u ON u.id = s.user_id
-        WHERE s.status = 'pending'
-        ORDER BY s.created_at ASC LIMIT 100
-      `)
-    ]);
+async function initDatabase() {
+  // Do not redefine or drop existing application tables.
+  // These columns match the existing schema.sql supplied for TaskForge AI.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS ai_task_queue (
+      id BIGSERIAL PRIMARY KEY,
+      task_type VARCHAR(40) NOT NULL,
+      payload JSONB NOT NULL,
+      status VARCHAR(20) NOT NULL DEFAULT 'draft'
+        CHECK (status IN ('draft','published','deleted')),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+}
 
-    const submissionCards = submissions.rows.map(s => `
-      <section class="card">
-        <h3>${escapeHtml(s.title)}</h3>
-        <p>Worker: ${escapeHtml(s.name)}</p>
-        <pre>${escapeHtml(s.answer)}</pre>
-        <form method="post" action="/admin/submissions/${s.id}/review">
-          ${csrfField(req)}
-          <textarea name="note" maxlength="2000" placeholder="Review note (optional)"></textarea>
-          <button name="decision" value="approved">Approve</button>
-          <button name="decision" value="rejected" style="background:#b91c1c">Reject</button>
-        </form>
-      </section>
-    `).join('');
-
-    const screeningCards = screenings.rows.map(s => `
-      <section class="card">
-        <h3>Screening: ${escapeHtml(s.name)}</h3>
-        <p>${escapeHtml(s.email)}</p>
-        <pre>${escapeHtml(JSON.stringify(s.answers, null, 2))}</pre>
-        <form method="post" action="/admin/screenings/${s.id}/review">
-          ${csrfField(req)}
-          <button name="decision" value="approved">Approve screening</button>
-          <button name="decision" value="rejected" style="background:#b91c1c">Reject screening</button>
-        </form>
-      </section>
-    `).join('');
-
-    res.send(page('Reviews', `
-      <h1>Pending screening reviews</h1>
-      ${screeningCards || '<section class="card">No pending screenings.</section>'}
-      <h1>Pending task submissions</h1>
-      ${submissionCards || '<section class="card">No pending submissions.</section>'}
-    `, req.session.user));
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/admin/submissions/:id/review', requireAdmin, async (req, res, next) => {
-  try {
-    const decision = String(req.body.decision || '');
-    if (!['approved', 'rejected'].includes(decision)) {
-      return res.status(400).send(page('Review', notice('Invalid review decision.'), req.session.user));
-    }
-
-    await pool.query(`
-      UPDATE submissions SET status = $1, reviewer_note = $2, reviewed_at = NOW()
-      WHERE id = $3 AND status = 'pending'
-    `, [decision, String(req.body.note || '').slice(0, 2000), req.params.id]);
-
-    res.redirect('/admin/reviews');
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/admin/screenings/:id/review', requireAdmin, async (req, res, next) => {
-  try {
-    const decision = String(req.body.decision || '');
-    if (!['approved', 'rejected'].includes(decision)) {
-      return res.status(400).send(page('Screening review', notice('Invalid decision.'), req.session.user));
-    }
-
-    await pool.query(`
-      UPDATE screenings SET status = $1, reviewed_at = NOW()
-      WHERE id = $2 AND status = 'pending'
-    `, [decision, req.params.id]);
-
-    res.redirect('/admin/reviews');
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.get('/admin/payouts', requireAdmin, async (req, res, next) => {
-  try {
-    const result = await pool.query(`
-      SELECT p.id, p.amount, p.paypal_email, p.status,
-             p.transaction_id, p.created_at, u.name
-      FROM payouts p JOIN users u ON u.id = p.user_id
-      ORDER BY p.created_at DESC LIMIT 100
-    `);
-
-    const cards = result.rows.map(p => `
-      <section class="card">
-        <h3>${escapeHtml(p.name)}</h3>
-        <p>Amount: $${Number(p.amount).toFixed(2)}</p>
-        <p>PayPal: ${escapeHtml(p.paypal_email)}</p>
-        <p>Status: ${escapeHtml(p.status)}</p>
-        <form method="post" action="/admin/payouts/${p.id}">
-          ${csrfField(req)}
-          <input name="transaction_id" placeholder="PayPal transaction ID" maxlength="200">
-          <button name="decision" value="paid">Mark paid</button>
-          <button name="decision" value="rejected" style="background:#b91c1c">Reject payout</button>
-        </form>
-      </section>
-    `).join('');
-
-    res.send(page('Payouts', `
-      <h1>Manual PayPal payouts</h1>
-      <p>Send payments yourself through PayPal, then record the transaction here.</p>
-      ${cards || '<section class="card">No payout requests.</section>'}
-    `, req.session.user));
-  } catch (err) {
-    next(err);
-  }
-});
-
-app.post('/admin/payouts/:id', requireAdmin, async (req, res, next) => {
-  try {
-    const decision = String(req.body.decision || '');
-    if (!['paid', 'rejected'].includes(decision)) {
-      return res.status(400).send(page('Payout', notice('Invalid payout status.'), req.session.user));
-    }
-
-    const txId = String(req.body.transaction_id || '').trim().slice(0, 200);
-
-    if (decision === 'paid' && !txId) {
-      return res.status(400).send(page('Payout', notice('Enter the PayPal transaction ID before marking paid.'), req.session.user));
-    }
-
-    await pool.query(`
-      UPDATE payouts SET status = $1, transaction_id = $2
-      WHERE id = $3 AND status = 'pending'
-    `, [decision, txId || null, req.params.id]);
-
-    res.redirect('/admin/payouts');
-  } catch (err) {
-    next(err);
-  }
+app.use((req, res) => {
+  res.status(404).send(page('Not found', '<h1>Page not found</h1>', req.session.user));
 });
 
 app.use((err, req, res, next) => {
-  console.error('Request failed:', err.message);
+  console.error('Unhandled request error:', err.message);
   if (res.headersSent) return next(err);
-
-  res.status(500).send(page(
-    'Server error',
-    notice('Something went wrong. Check Render logs for details. Do not share passwords or API keys.'),
-    req.session.user
-  ));
+  res.status(500).send(page('Server error', '<h1>Something went wrong</h1><p>Please try again later.</p>', req.session.user));
 });
 
-async function start() {
-  try {
-    await pool.query('SELECT 1');
-    await initDatabase();
-
+initDatabase()
+  .then(() => {
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`TaskForge AI listening on port ${PORT}`);
-      console.log(`OpenAI configured: ${Boolean(openai)}`);
     });
-  } catch (err) {
-    console.error('Startup failed:', err.message);
+  })
+  .catch(err => {
+    console.error('Database initialization failed:', err.message);
     process.exit(1);
-  }
-}
-
-start();
+  });
