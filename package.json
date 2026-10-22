@@ -1,7 +1,8 @@
 {
   "name": "taskforge-ai",
   "version": "1.0.0",
-  "description": "AI training and transcription task platform",
+  "private": true,
+  "description": "AI training, video annotation and transcription platform",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -11,6 +12,16 @@
   },
   "dependencies": {
     "express": "^5.1.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "bcryptjs": "^3.0.2",
+    "express-session": "^1.18.2",
+    "connect-pg-simple": "^10.0.0",
+    "helmet": "^8.1.0",
+    "express-rate-limit": "^8.0.1",
+    "multer": "^2.0.2",
+    "cloudinary": "^2.7.0",
+    "ejs": "^3.1.10",
+    "express-ejs-layouts": "^2.5.1",
+    "dotenv": "^16.6.1"
   }
 }
